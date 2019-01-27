@@ -1,0 +1,12 @@
+{
+    "minimum-stability": "stable",
+    "require": {
+        "php": "^7.3",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "hollodotme/fast-cgi-client": "^2.4",
+        "guzzlehttp/guzzle": "^6.3",
+        "symfony/http-foundation": "^4.2",
+        "symfony/process": "^4.2"
+    }
+}
