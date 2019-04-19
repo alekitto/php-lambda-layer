@@ -233,13 +233,14 @@ cp /var/layer/bootstrap .
 cp /var/layer/php.ini .
 
 sed -i "s/;request_terminate_timeout = 0/request_terminate_timeout = 5/g" /opt/etc/php-fpm.d/www.conf.default
-sed -i "s/;listen.allowed_clients = 127.0.0.1/listen.allowed_clients = 127.0.0.1/g" /opt/etc/php-fpm.d/www.conf.default
-sed -i "s/user = www-data/;user = www-data/g" /opt/etc/php-fpm.d/www.conf.default
-sed -i "s/group = www-data/;group = www-data/g" /opt/etc/php-fpm.d/www.conf.default
+#sed -i "s/;listen.allowed_clients = 127.0.0.1/listen.allowed_clients = 127.0.0.1/g" /opt/etc/php-fpm.d/www.conf.default
+sed -i "s/^user = www-data/;user = www-data/g" /opt/etc/php-fpm.d/www.conf.default
+sed -i "s/^group = www-data/;group = www-data/g" /opt/etc/php-fpm.d/www.conf.default
 sed -i "s/;error_log = log\\/php-fpm.log/error_log = \\/dev\\/stderr/g" /opt/etc/php-fpm.conf.default
 
 echo "php_admin_value[error_log] = /dev/stderr" >> /opt/etc/php-fpm.d/www.conf.default
 echo "php_admin_flag[log_errors] = on" >> /opt/etc/php-fpm.d/www.conf.default
+echo "clear_env = no" >> /opt/etc/php-fpm.d/www.conf.default
 
 /opt/bin/php /usr/bin/composer install
 

@@ -1,14 +1,18 @@
 #!/opt/bin/php -c/opt/php.ini
-<?php
+<?php declare(strict_types=1, ticks=5);
 
 use hollodotme\FastCGI;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Process\Process;
 
 error_reporting(E_ALL | E_STRICT);
-require 'vendor/autoload.php';
+require __DIR__.'/vendor/autoload.php';
 
 $AWS_LAMBDA_RUNTIME_API = \getenv('AWS_LAMBDA_RUNTIME_API');
+$timezone = \getenv('TZ');
+if (':UTC' === $timezone) {
+    \putenv('TZ=Etc/UTC');
+}
 
 function start_server(): Process
 {
@@ -32,12 +36,18 @@ class CGIRequest extends FastCGI\Requests\AbstractRequest
      */
     private $invocationId;
 
-    public function __construct(string $method, string $invocationId, string $scriptFilename, string $content)
+    /**
+     * @var bool
+     */
+    private $isAlb;
+
+    public function __construct(string $method, string $invocationId, bool $isAlb, string $scriptFilename, string $content)
     {
         parent::__construct($scriptFilename, $content);
 
         $this->method = $method;
         $this->invocationId = $invocationId;
+        $this->isAlb = $isAlb;
     }
 
     public function getRequestMethod(): string
@@ -45,9 +55,29 @@ class CGIRequest extends FastCGI\Requests\AbstractRequest
         return $this->method;
     }
 
-    public function getInvocationId(): string
+    public function getResponseCallbacks(): array
     {
-        return $this->invocationId;
+        return [
+            function (FastCGI\Interfaces\ProvidesResponseData $response): void {
+                send_response(
+                    $this->invocationId,
+                    $this->isAlb,
+                    $response->getHeader('Status') ?: '200 OK',
+                    $response->getBody(),
+                    $response->getHeaders()
+                );
+            },
+        ];
+    }
+
+    public function getFailureCallbacks(): array
+    {
+        return [
+            function (\Throwable $e): void {
+                echo 'ERROR: ' . $e->getMessage();
+                send_response($this->invocationId, $this->isAlb, '500 Internal Server Error');
+            },
+        ];
     }
 }
 
@@ -65,6 +95,7 @@ $connection = new FastCGI\SocketConnections\NetworkSocket('127.0.0.1', 9000, 500
 $client = new FastCGI\Client($connection);
 
 $apiClient = new GuzzleHttp\Client([
+    'handler' => new GuzzleHttp\HandlerStack(new GuzzleHttp\Handler\CurlHandler()),
     'timeout' => 0.05,
 ]);
 $nextRequest = new GuzzleHttp\Psr7\Request(Request::METHOD_GET, "http://$AWS_LAMBDA_RUNTIME_API/2018-06-01/runtime/invocation/next");
@@ -72,63 +103,54 @@ $nextRequest = new GuzzleHttp\Psr7\Request(Request::METHOD_GET, "http://$AWS_LAM
 $handler = \getenv('_HANDLER');
 $filename = \getenv('LAMBDA_TASK_ROOT').DIRECTORY_SEPARATOR.\substr($handler, 0, \strrpos($handler, '.')).'.php';
 
-$requests = [];
-
-function purge_timed_out_requests(): void
+function send_response(string $invocationId, bool $isALB, string $status = '200 OK', string $body = '', array $headers = []): void
 {
-    global $requests;
-    $time = \time();
+    global $AWS_LAMBDA_RUNTIME_API, $apiClient;
 
-    foreach (\array_keys($requests) as $requestId) {
-        if ($requests[$requestId][1] > $time) {
-            unset($requests[$requestId]);
-        }
+    $responseBody = [
+        'body' => $body,
+        'statusCode' => (int) \preg_replace('/^(\d+).+$/', '$1', $status),
+        'headers' => $headers,
+        'isBase64Encoded' => false,
+    ];
+
+    if ($isALB) {
+        $responseBody['statusDescription'] = $status;
     }
+
+    $responseBody = \json_encode($responseBody);
+    $responseRequest = new GuzzleHttp\Psr7\Request(
+        Request::METHOD_POST,
+        "http://$AWS_LAMBDA_RUNTIME_API/2018-06-01/runtime/invocation/$invocationId/response",
+        [
+            'Content-Type' => 'application/json',
+            'Content-Length' => \strlen($responseBody),
+        ],
+        $responseBody,
+    );
+
+    $apiClient->sendAsync($responseRequest, [
+        GuzzleHttp\RequestOptions::HTTP_ERRORS => false,
+    ]);
 }
 
-while (true) {
-    if ($client->hasUnhandledResponses()) {
-        $readyRequestIds = $client->getRequestIdsHavingResponse();
+register_tick_function(function (): void {
+    global $client, $process;
 
-        # read all ready responses
-        foreach ($readyRequestIds as $requestId) {
-            $response = $client->readResponse($requestId, 100);
-            /** @var CGIRequest $cgiRequest */
-            $cgiRequest = $requests[$requestId][0];
-
-            $statusHeader = $response->getHeader('Status');
-            $body = \json_encode([
-                'body' => $response->getBody(),
-                'statusCode' => (int) preg_replace('/^(\d+).+$/', '$1', $statusHeader),
-                'statusDescription' => $statusHeader,
-                'headers' => $response->getHeaders(),
-                'isBase64Encoded' => false,
-            ]);
-
-            $responseRequest = new GuzzleHttp\Psr7\Request(
-                Request::METHOD_POST,
-                "http://$AWS_LAMBDA_RUNTIME_API/2018-06-01/runtime/invocation/{$cgiRequest->getInvocationId()}/response",
-                [
-                    'Content-Type' => 'application/json',
-                    'Content-Length' => \strlen($body),
-                ],
-                $body,
-            );
-
-            $apiClient->send($responseRequest);
-        }
-    }
-
+    $client->handleReadyResponses(100);
     $process->getExitCode();
+});
+
+while (true) {
     $nextInvocation = $apiClient->sendAsync($nextRequest);
     try {
         /** @var \Psr\Http\Message\ResponseInterface $response */
         $response = $nextInvocation->wait();
     } catch (GuzzleHttp\Exception\RequestException $exception) {
-        purge_timed_out_requests();
         continue;
     }
 
+    /** @var string $invocationId */
     $invocationId = $response->getHeader('lambda-runtime-aws-request-id')[0] ?? null;
     if (null === $invocationId) {
         continue;
@@ -136,25 +158,17 @@ while (true) {
 
     $event = \json_decode((string)$response->getBody(), TRUE);
     if (! isset($event['httpMethod'])) {
-        $body = \json_encode([
-            'body' => 'Unknown event',
-            'statusCode' => 500,
-            'statusDescription' => '500 Internal Server Error',
-            'headers' => [],
-            'isBase64Encoded' => false,
-        ]);
-
-        $responseRequest = new GuzzleHttp\Psr7\Request(
-            Request::METHOD_POST,
-            "http://$AWS_LAMBDA_RUNTIME_API/2018-06-01/runtime/invocation/{$invocationId}/response",
+        send_response(
+            $invocationId,
+            false,
+            '500 Internal Server Error',
+            'Unknown event',
             [
                 'Content-Type' => 'application/json',
                 'Content-Length' => \strlen($body),
-            ],
-            $body,
+            ]
         );
 
-        $apiClient->send($responseRequest);
         \usleep(10);
         continue;
     }
@@ -164,13 +178,24 @@ while (true) {
         $body = \base64_decode($body);
     }
 
-    $query = \http_build_query($event['multiValueQueryStringParameters'] ?? $event['queryStringParameters'] ?? []);
-    $cgiRequest = new CGIRequest($event['httpMethod'], $invocationId, $filename, $body);
+    $queryParams = $event['queryStringParameters'] ?? [];
+    foreach ($event['multiValueQueryStringParameters'] ?? [] as $name => $values) {
+        $queryParams[$name] = \is_array($values) && \count($values) === 1 ? $values[0] : $values;
+    }
+
+    $query = \http_build_query($queryParams);
+    $cgiRequest = new CGIRequest($event['httpMethod'], $invocationId, \array_key_exists('elb', $event['requestContext'] ?? []), $filename, $body);
+    $cgiRequest->setServerPort((int) ($event['headers']['X-Forwarded-Port'] ?? 80));
     $cgiRequest->setCustomVar('QUERY_STRING', $query);
     $cgiRequest->setCustomVar('HTTPS', 'on');
+    $cgiRequest->setCustomVar('REMOTE_ADDR', $event['requestContext']['identity']['sourceIp'] ?? '127.0.0.1');
 
     $cgiRequest->setRequestUri('https://localhost' . $event['path'] . '?' . $query);
     foreach ($event['multiValueHeaders'] ?? $event['headers'] ?? [] as $name => $values) {
+        if (\is_array($values)) {
+            $values = $values[0];
+        }
+
         if ('content-type' === \mb_strtolower($name)) {
             $cgiRequest->setContentType($values);
         } elseif ('content-length' !== \mb_strtolower($name)) {
@@ -181,5 +206,4 @@ while (true) {
     $cgiRequest->setCustomVar('_X_AMZN_TRACE_ID', $response->getHeader('Lambda-Runtime-Trace-Id')[0]);
 
     $requestId = $client->sendAsyncRequest($cgiRequest);
-    $requests[$requestId] = [$cgiRequest, \time() + 60];
 }
